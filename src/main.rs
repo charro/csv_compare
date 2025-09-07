@@ -36,7 +36,11 @@ struct Args {
 
     /// Column separator character. If not provided, first column would be used instead
     #[arg(default_value = "", long, short = 'l')]
-    sorting_column: String
+    sorting_column: String,
+
+    /// Generate a detailed report file when files are different
+    #[arg(default_value = "false", long, short = 'r')]
+    report: bool
 }
 
 fn main() {
@@ -62,7 +66,7 @@ fn main() {
     let first_file_lf = get_lazy_frame(first_file_path, separator);
     let second_file_lf = get_lazy_frame(second_file_path, separator);
 
-    let row_num = assert_both_frames_have_same_row_num(&first_file_lf, &second_file_lf);
+    let row_num = assert_both_frames_have_same_row_num(&first_file_lf, &second_file_lf, &args, first_file_path, second_file_path);
     println!("{}: {}", "Files have same number of rows".green(), row_num);
 
     let first_file_cols = get_column_names(&first_file_lf);
@@ -72,6 +76,9 @@ fn main() {
         &first_file_cols,
         &second_file_cols,
         args.strict_column_order,
+        &args,
+        first_file_path,
+        second_file_path,
     );
     println!("{}", "Files have comparable columns".green());
 
@@ -126,6 +133,22 @@ fn main() {
                     "are different".red()
                 );
 
+                // Generate report if requested
+                if args.report {
+                    println!("{}", "Generating detailed report of differences...".yellow());
+                    if let Ok(report_file) = find_differences_and_generate_report(
+                        first_file_path,
+                        second_file_path,
+                        separator,
+                        sorting_column,
+                        Some(args.number_of_columns * 1000), // Use a reasonable batch size
+                    ) {
+                        println!("Report saved to: {}", report_file.green());
+                    } else {
+                        println!("{}", "Failed to generate report file".red());
+                    }
+                }
+
                 exit(3);
             }
             progress_bar.inc(columns_to_compare.len() as u64);
@@ -146,6 +169,9 @@ fn main() {
 fn assert_both_frames_have_same_row_num(
     first_lazy_frame: &LazyFrame,
     second_lazy_frame: &LazyFrame,
+    args: &Args,
+    _file1_path: &str,
+    _file2_path: &str,
 ) -> u32 {
     let first_row_num = get_rows_num(first_lazy_frame);
     let second_row_num = get_rows_num(second_lazy_frame);
@@ -159,6 +185,12 @@ fn assert_both_frames_have_same_row_num(
             second_row_num.to_string()
         );
 
+        // Generate report if requested
+        if args.report {
+            println!("{}", "Cannot generate detailed report: files have different row counts".yellow());
+            println!("{}", "Use files with the same number of rows for detailed comparison reports".yellow());
+        }
+
         exit(4);
     }
 
@@ -169,6 +201,9 @@ fn assert_both_frames_are_comparable(
     first_file_cols: &[String],
     second_file_cols: &[String],
     is_strict_order: bool,
+    args: &Args,
+    file1_path: &str,
+    file2_path: &str,
 ) {
     let have_same_columns = if is_strict_order {
         first_file_cols.eq(second_file_cols)
@@ -195,6 +230,25 @@ fn assert_both_frames_are_comparable(
                 "flag is active"
             );
         }
+
+        // Generate report if requested
+        if args.report {
+            println!("{}", "Generating detailed report of differences...".yellow());
+            // Get the first column name from the first file for sorting
+            let first_col_name = first_file_cols[0].clone();
+            if let Ok(report_file) = find_differences_and_generate_report(
+                file1_path,
+                file2_path,
+                args.separator,
+                &first_col_name,
+                Some(20000), // Default batch size
+            ) {
+                println!("Report saved to: {}", report_file.green());
+            } else {
+                println!("{}", "Failed to generate report file".red());
+            }
+        }
+
         exit(2);
     }
 }
@@ -261,7 +315,7 @@ fn find_differences_and_generate_report(
     sorting_column: &str,
     batch_size: Option<usize>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let batch_size = batch_size.unwrap_or(10000); // Default batch size of 10k rows
+    let batch_size = batch_size.unwrap_or(20000); // Default batch size of 10k rows
     
     // Create lazy frames for both files
     let lf1 = LazyCsvReader::new(file1_path)
@@ -312,6 +366,9 @@ fn find_differences_and_generate_report(
     writeln!(report_file, "Batch Size: {}", batch_size)?;
     writeln!(report_file, "")?;
     
+    // Determine if we should use compact format (more than 50 differences)
+    let mut all_differences = Vec::new();
+    
     let mut total_differences = 0;
     let mut rows_with_differences = 0;
     let mut global_row_idx = 0;
@@ -347,6 +404,10 @@ fn find_differences_and_generate_report(
         for batch_row_idx in 0..current_batch_size {
             let mut row_differences = Vec::new();
             
+            // Get the sorting column value for this row (used for identification)
+            let sorting_col1 = df1_batch.column(sorting_column).unwrap();
+            let sorting_value = sorting_col1.get(batch_row_idx).unwrap().to_string();
+            
             // Compare each column in the current row
             for col_name in &column_names {
                 // Get values from both dataframes using column access
@@ -363,17 +424,10 @@ fn find_differences_and_generate_report(
                 }
             }
             
-            // If this row has differences, write them to the report
+            // If this row has differences, collect them
             if !row_differences.is_empty() {
                 rows_with_differences += 1;
-                writeln!(report_file, "Row {} (sorted by '{}'):", global_row_idx + 1, sorting_column)?;
-                
-                for (col_name, val1, val2) in row_differences {
-                    writeln!(report_file, "  Column '{}':", col_name)?;
-                    writeln!(report_file, "    File 1: {}", val1)?;
-                    writeln!(report_file, "    File 2: {}", val2)?;
-                }
-                writeln!(report_file, "")?;
+                all_differences.push((global_row_idx + 1, sorting_value, row_differences));
             }
             
             global_row_idx += 1;
@@ -390,6 +444,63 @@ fn find_differences_and_generate_report(
         pb.finish();
     }
     
+    // Write differences in appropriate format
+    if total_differences == 0 {
+        writeln!(report_file, "✅ Files are identical!")?;
+    } else if total_differences <= 50 {
+        // Use detailed format for small number of differences
+        writeln!(report_file, "Differences found:")?;
+        writeln!(report_file, "==================")?;
+        writeln!(report_file, "")?;
+        
+        for (row_num, sorting_value, row_diffs) in all_differences {
+            writeln!(report_file, "Row {} ({} = {}):", row_num, sorting_column, sorting_value)?;
+            for (col_name, val1, val2) in row_diffs {
+                writeln!(report_file, "  Column '{}':", col_name)?;
+                writeln!(report_file, "    File 1: {}", val1)?;
+                writeln!(report_file, "    File 2: {}", val2)?;
+            }
+            writeln!(report_file, "")?;
+        }
+    } else {
+        // Use compact CSV format for large number of differences
+        writeln!(report_file, "Differences found (CSV format for easy import into Excel/other tools):")?;
+        writeln!(report_file, "=================================================================")?;
+        writeln!(report_file, "")?;
+        
+        // Write CSV header
+        writeln!(report_file, "Row,Sorting_Value,Column,File_1_Value,File_2_Value")?;
+        
+        for (row_num, sorting_value, row_diffs) in all_differences {
+            for (col_name, val1, val2) in row_diffs {
+                // Escape CSV values (handle quotes and commas)
+                let escape_csv = |s: &str| -> String {
+                    // Remove surrounding quotes if they exist (from polars string conversion)
+                    let cleaned = if s.starts_with('"') && s.ends_with('"') && s.len() > 1 {
+                        &s[1..s.len()-1]
+                    } else {
+                        s
+                    };
+                    
+                    if cleaned.contains(',') || cleaned.contains('"') || cleaned.contains('\n') {
+                        format!("\"{}\"", cleaned.replace("\"", "\"\""))
+                    } else {
+                        cleaned.to_string()
+                    }
+                };
+                
+                writeln!(report_file, "{},{},{},{},{}", 
+                    row_num, 
+                    escape_csv(&sorting_value),
+                    escape_csv(&col_name),
+                    escape_csv(&val1),
+                    escape_csv(&val2)
+                )?;
+            }
+        }
+        writeln!(report_file, "")?;
+    }
+    
     // Write summary
     writeln!(report_file, "Summary:")?;
     writeln!(report_file, "=========")?;
@@ -397,12 +508,13 @@ fn find_differences_and_generate_report(
     writeln!(report_file, "Total individual cell differences: {}", total_differences)?;
     writeln!(report_file, "Rows without differences: {}", total_rows - rows_with_differences)?;
     
-    if total_differences == 0 {
+    if total_differences > 0 {
         writeln!(report_file, "")?;
-        writeln!(report_file, "✅ Files are identical!")?;
-    } else {
-        writeln!(report_file, "")?;
-        writeln!(report_file, "❌ Files have differences as listed above.")?;
+        if total_differences <= 50 {
+            writeln!(report_file, "❌ Files have differences as listed above.")?;
+        } else {
+            writeln!(report_file, "❌ Files have many differences. Using CSV format for easy import into Excel/other tools.")?;
+        }
     }
     
     Ok(report_filename)
@@ -447,8 +559,8 @@ mod tests {
         assert!(report_content.contains("CSV Differences Report"));
         assert!(report_content.contains("File 1: test1.csv"));
         assert!(report_content.contains("File 2: test2.csv"));
-        assert!(report_content.contains("Row 1"));
-        assert!(report_content.contains("Row 3"));
+        assert!(report_content.contains("Row 1 (id = \"1\")"));
+        assert!(report_content.contains("Row 3 (id = \"3\")"));
         assert!(report_content.contains("age"));
         assert!(report_content.contains("25"));
         assert!(report_content.contains("26"));
@@ -500,4 +612,5 @@ mod tests {
         fs::remove_file(&report_file).unwrap_or_default();
     }
 }
+
 
