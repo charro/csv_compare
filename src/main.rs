@@ -474,7 +474,7 @@ fn find_differences_and_generate_report(
             // If this row has differences, collect them
             if !row_differences.is_empty() {
                 rows_with_differences += 1;
-                all_differences.push((batch_start + batch_row_idx + 1, sorting_value, row_differences));
+                all_differences.push((sorting_value, row_differences)); // Removed row number
             }
         }
 
@@ -500,8 +500,8 @@ fn find_differences_and_generate_report(
         writeln!(report_file, "==================")?;
         writeln!(report_file, "")?;
 
-        for (row_num, sorting_value, row_diffs) in &all_differences {
-            writeln!(report_file, "Row {} ({} = {}):", row_num, sorting_column, sorting_value)?;
+        for (sorting_value, row_diffs) in &all_differences {
+            writeln!(report_file, "{} = {}:", sorting_column, sorting_value)?;
             for (col_name, val1, val2) in row_diffs {
                 writeln!(report_file, "  Column '{}':", col_name)?;
                 writeln!(report_file, "    File 1: {}", val1)?;
@@ -521,8 +521,8 @@ fn find_differences_and_generate_report(
         let mut csv_writer = std::io::BufWriter::with_capacity(65536, csv_file);
         csv_file_created = true;
 
-        // Write CSV header
-        writeln!(csv_writer, "Row,Sorting_Value,Column,File_1_Value,File_2_Value")?;
+        // Write CSV header - removed Row column
+        writeln!(csv_writer, "Sorting_Value,Column,File_1_Value,File_2_Value")?;
 
         // Helper function to escape CSV values properly
         let escape_csv = |s: &str| -> String {
@@ -540,11 +540,10 @@ fn find_differences_and_generate_report(
             }
         };
 
-        // Write all differences to CSV efficiently
-        for (row_num, sorting_value, row_diffs) in &all_differences {
+        // Write all differences to CSV efficiently - removed row number
+        for (sorting_value, row_diffs) in &all_differences {
             for (col_name, val1, val2) in row_diffs {
-                writeln!(csv_writer, "{},{},{},{},{}",
-                         row_num,
+                writeln!(csv_writer, "{},{},{},{}",
                          escape_csv(sorting_value),
                          escape_csv(col_name),
                          escape_csv(val1),
@@ -563,8 +562,8 @@ fn find_differences_and_generate_report(
 
         let sample_count = std::cmp::min(10, all_differences.len());
         for i in 0..sample_count {
-            let (row_num, sorting_value, row_diffs) = &all_differences[i];
-            writeln!(report_file, "Row {} ({} = {}):", row_num, sorting_column, sorting_value)?;
+            let (sorting_value, row_diffs) = &all_differences[i];
+            writeln!(report_file, "{} = {}:", sorting_column, sorting_value)?;
             for (col_name, val1, val2) in row_diffs {
                 writeln!(report_file, "  Column '{}':", col_name)?;
                 writeln!(report_file, "    File 1: {}", val1)?;
