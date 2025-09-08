@@ -34,7 +34,8 @@ struct Args {
     #[arg(default_value = ",", long, short = 'p')]
     separator: char,
 
-    /// Column separator character. If not provided, first column would be used instead
+    /// Sorting column(s). If not provided, first column would be used instead.
+    /// For multiple columns, separate them with commas (e.g., "id,date,type")
     #[arg(default_value = "", long, short = 'l')]
     sorting_column: String,
 
@@ -82,14 +83,28 @@ fn main() {
     );
     println!("{}", "Files have comparable columns".green());
 
-    let sorting_column = if sorting_column != "" {&sorting_column.to_string()} else {&first_file_cols[0]};
-    println!("Sorting data by column {}", sorting_column);
+    // Parse sorting columns
+    let sorting_columns: Vec<String> = if sorting_column.is_empty() {
+        vec![first_file_cols[0].clone()]
+    } else {
+        sorting_column.split(',').map(|s| s.trim().to_string()).collect()
+    };
 
-    let columns_to_iterate = (first_file_cols.len() - 1) as u64;
+    // Validate that all sorting columns exist
+    for sort_col in &sorting_columns {
+        if !first_file_cols.contains(sort_col) {
+            println!("{}: Sorting column '{}' not found in files", "ERROR".red(), sort_col);
+            exit(1);
+        }
+    }
+
+    println!("Sorting data by column(s): {}", sorting_columns.join(", "));
+
+    let columns_to_iterate = (first_file_cols.len() - sorting_columns.len()) as u64;
 
     println!(
-        "Comparing content of columns in both files when sorted by column \"{}\"...",
-        sorting_column
+        "Comparing content of columns in both files when sorted by column(s) \"{}\"...",
+        sorting_columns.join(", ")
     );
     let progress_bar = ProgressBar::new(columns_to_iterate);
     progress_bar.set_style(
@@ -101,8 +116,15 @@ fn main() {
     let mut columns_with_differences = HashSet::new(); // Track columns that have differences
     let mut files_are_different = false; // Track if any differences were found
 
-    for i in 1..first_file_cols.len() {
+    // Skip sorting columns when comparing
+    for i in 0..first_file_cols.len() {
         let column_name = &first_file_cols[i];
+
+        // Skip sorting columns
+        if sorting_columns.contains(column_name) {
+            continue;
+        }
+
         columns_to_compare.push(column_name);
 
         if columns_to_compare.len() == number_of_columns_to_compare
@@ -110,13 +132,13 @@ fn main() {
         {
             let first_data_frame = get_sorted_data_frame_for_columns(
                 &first_file_lf,
-                sorting_column,
+                &sorting_columns,
                 &columns_to_compare,
             );
 
             let second_data_frame = get_sorted_data_frame_for_columns(
                 &second_file_lf,
-                sorting_column,
+                &sorting_columns,
                 &columns_to_compare,
             );
 
@@ -125,14 +147,12 @@ fn main() {
 
                 // Find which specific columns have differences
                 for col_name in &columns_to_compare {
-                    if *col_name != sorting_column {
-                        let col1 = first_data_frame.column(col_name).unwrap();
-                        let col2 = second_data_frame.column(col_name).unwrap();
+                    let col1 = first_data_frame.column(col_name).unwrap();
+                    let col2 = second_data_frame.column(col_name).unwrap();
 
-                        // Check if this specific column has differences
-                        if col1 != col2 {
-                            columns_with_differences.insert(col_name.to_string());
-                        }
+                    // Check if this specific column has differences
+                    if col1 != col2 {
+                        columns_with_differences.insert(col_name.to_string());
                     }
                 }
             }
@@ -163,7 +183,7 @@ fn main() {
             "Total columns with differences:".red(),
             diff_columns.len().to_string().red().bold(),
             "out of".red(),
-            (first_file_cols.len() - 1).to_string().red().bold() // Exclude sorting column
+            (first_file_cols.len() - sorting_columns.len()).to_string().red().bold() // Exclude sorting columns
         );
 
         // Generate report if requested
@@ -173,7 +193,7 @@ fn main() {
                 first_file_path,
                 second_file_path,
                 separator,
-                sorting_column,
+                &sorting_columns,
                 Some(args.number_of_columns * 1000), // Use a reasonable batch size
                 &columns_with_differences, // Pass the columns that have differences
             ) {
@@ -189,8 +209,8 @@ fn main() {
             "Files {} and {} {} {}",
             first_file_path.bold(),
             second_file_path.bold(),
-            "ARE IDENTICAL WHEN SORTED BY COLUMN:".green(),
-            sorting_column.green()
+            "ARE IDENTICAL WHEN SORTED BY COLUMN(S):".green(),
+            sorting_columns.join(", ").green()
         );
     }
 }
@@ -225,6 +245,7 @@ fn assert_both_frames_have_same_row_num(
 
     return first_row_num;
 }
+
 
 fn assert_both_frames_are_comparable(
     first_file_cols: &[String],
@@ -264,14 +285,14 @@ fn assert_both_frames_are_comparable(
         if args.report {
             println!("{}", "Generating detailed report of differences...".yellow());
             // Get the first column name from the first file for sorting
-            let first_col_name = first_file_cols[0].clone();
+            let first_col_names = vec![first_file_cols[0].clone()];
             // For column differences, we need to compare all columns
             let all_columns: HashSet<String> = first_file_cols.iter().skip(1).cloned().collect();
             if let Ok(report_file) = find_differences_and_generate_report(
                 file1_path,
                 file2_path,
                 args.separator,
-                &first_col_name,
+                &first_col_names,
                 Some(20000), // Default batch size
                 &all_columns, // Compare all columns when column structure is different
             ) {
@@ -307,23 +328,34 @@ fn get_column_names(lazy_frame: &LazyFrame) -> Vec<String> {
 
 fn get_sorted_data_frame_for_columns(
     lazy_frame: &LazyFrame,
-    sorting_by_column: &String,
+    sorting_by_columns: &Vec<String>,
     columns: &Vec<&String>,
 ) -> DataFrame {
-    let mut all_columns = vec![col(sorting_by_column)];
+    let mut all_columns = Vec::new();
+
+    // Add sorting columns first
+    for sort_col in sorting_by_columns {
+        all_columns.push(col(sort_col));
+    }
+
+    // Add comparison columns
     for next_column in columns {
         // We must de-reference next_column as the iterator returns a reference of a reference
-        if *next_column != sorting_by_column {
+        if !sorting_by_columns.contains(*next_column) {
             all_columns.push(col(next_column));
         }
     }
 
-    lazy_frame
-        .clone()
-        .select(all_columns)
-        .sort(sorting_by_column, SortOptions::default())
+    let mut lazy_query = lazy_frame.clone().select(all_columns);
+
+    // Sort by multiple columns
+    for sort_col in sorting_by_columns {
+        lazy_query = lazy_query.sort(sort_col, SortOptions::default());
+    }
+
+    lazy_query
         .collect()
-        .expect(format!("Couldn't sort by column {sorting_by_column}",).as_str())
+        .expect("Couldn't sort by the specified columns")
 }
 
 fn get_rows_num(lazy_frame: &LazyFrame) -> u32 {
@@ -346,35 +378,39 @@ fn find_differences_and_generate_report(
     file1_path: &str,
     file2_path: &str,
     separator: char,
-    sorting_column: &str,
+    sorting_columns: &Vec<String>,
     batch_size: Option<usize>,
     columns_with_differences: &HashSet<String>, // Only compare these columns
 ) -> Result<String, Box<dyn std::error::Error>> {
     let batch_size = batch_size.unwrap_or(50000);
 
     // Create lazy frames for both files
-    let lf1 = LazyCsvReader::new(file1_path)
+    let mut lf1 = LazyCsvReader::new(file1_path)
         .has_header(true)
         .with_infer_schema_length(Some(0))
         .with_separator(separator as u8)
-        .finish()?
-        .sort(sorting_column, SortOptions::default());
+        .finish()?;
 
-    let lf2 = LazyCsvReader::new(file2_path)
+    let mut lf2 = LazyCsvReader::new(file2_path)
         .has_header(true)
         .with_infer_schema_length(Some(0))
         .with_separator(separator as u8)
-        .finish()?
-        .sort(sorting_column, SortOptions::default());
+        .finish()?;
+
+    // Sort by multiple columns
+    for sort_col in sorting_columns {
+        lf1 = lf1.sort(sort_col, SortOptions::default());
+        lf2 = lf2.sort(sort_col, SortOptions::default());
+    }
 
     // Get total row count and all column names
-    let total_rows = lf1.clone().select([col(sorting_column)]).collect()?.height();
+    let total_rows = lf1.clone().select([col(&sorting_columns[0])]).collect()?.height();
     let all_column_names = get_column_names(&lf1);
 
-    // Create list of columns to compare (sorting column + columns with differences)
-    let mut columns_to_check = vec![sorting_column.to_string()];
+    // Create list of columns to compare (sorting columns + columns with differences)
+    let mut columns_to_check = sorting_columns.clone();
     for col_name in &all_column_names {
-        if columns_with_differences.contains(col_name) && col_name != sorting_column {
+        if columns_with_differences.contains(col_name) && !sorting_columns.contains(col_name) {
             columns_to_check.push(col_name.clone());
         }
     }
@@ -403,7 +439,7 @@ fn find_differences_and_generate_report(
     writeln!(report_file, "======================")?;
     writeln!(report_file, "File 1: {}", file1_path)?;
     writeln!(report_file, "File 2: {}", file2_path)?;
-    writeln!(report_file, "Sorting Column: {}", sorting_column)?;
+    writeln!(report_file, "Sorting Column(s): {}", sorting_columns.join(", "))?;
     writeln!(report_file, "Total Rows: {}", total_rows)?;
     writeln!(report_file, "Total Columns: {}", all_column_names.len())?;
     writeln!(report_file, "Columns with differences: {:?}", columns_with_differences.iter().collect::<Vec<_>>())?;
@@ -451,9 +487,14 @@ fn find_differences_and_generate_report(
         for batch_row_idx in 0..current_batch_size {
             let mut row_differences = Vec::new();
 
-            // Get the sorting column value for this row (used for identification)
-            let sorting_col1 = df1_batch.column(sorting_column).unwrap();
-            let sorting_value = sorting_col1.get(batch_row_idx).unwrap().to_string();
+            // Get the sorting column values for this row (used for identification)
+            let mut sorting_values = Vec::new();
+            for sort_col in sorting_columns {
+                let sorting_col1 = df1_batch.column(sort_col).unwrap();
+                let sorting_value = sorting_col1.get(batch_row_idx).unwrap().to_string();
+                sorting_values.push(format!("{} = {}", sort_col, sorting_value));
+            }
+            let composite_key = sorting_values.join(", ");
 
             // Compare only the columns that we know have differences
             for col_name in columns_with_differences {
@@ -474,7 +515,7 @@ fn find_differences_and_generate_report(
             // If this row has differences, collect them
             if !row_differences.is_empty() {
                 rows_with_differences += 1;
-                all_differences.push((sorting_value, row_differences)); // Removed row number
+                all_differences.push((composite_key, row_differences));
             }
         }
 
@@ -500,8 +541,8 @@ fn find_differences_and_generate_report(
         writeln!(report_file, "==================")?;
         writeln!(report_file, "")?;
 
-        for (sorting_value, row_diffs) in &all_differences {
-            writeln!(report_file, "{} = {}:", sorting_column, sorting_value)?;
+        for (composite_key, row_diffs) in &all_differences {
+            writeln!(report_file, "{}:", composite_key)?;
             for (col_name, val1, val2) in row_diffs {
                 writeln!(report_file, "  Column '{}':", col_name)?;
                 writeln!(report_file, "    File 1: {}", val1)?;
@@ -521,8 +562,8 @@ fn find_differences_and_generate_report(
         let mut csv_writer = std::io::BufWriter::with_capacity(65536, csv_file);
         csv_file_created = true;
 
-        // Write CSV header - removed Row column
-        writeln!(csv_writer, "Sorting_Value,Column,File_1_Value,File_2_Value")?;
+        // Write CSV header - with composite key
+        writeln!(csv_writer, "Composite_Key,Column,File_1_Value,File_2_Value")?;
 
         // Helper function to escape CSV values properly
         let escape_csv = |s: &str| -> String {
@@ -540,11 +581,11 @@ fn find_differences_and_generate_report(
             }
         };
 
-        // Write all differences to CSV efficiently - removed row number
-        for (sorting_value, row_diffs) in &all_differences {
+        // Write all differences to CSV efficiently
+        for (composite_key, row_diffs) in &all_differences {
             for (col_name, val1, val2) in row_diffs {
                 writeln!(csv_writer, "{},{},{},{}",
-                         escape_csv(sorting_value),
+                         escape_csv(composite_key),
                          escape_csv(col_name),
                          escape_csv(val1),
                          escape_csv(val2)
@@ -562,8 +603,8 @@ fn find_differences_and_generate_report(
 
         let sample_count = std::cmp::min(10, all_differences.len());
         for i in 0..sample_count {
-            let (sorting_value, row_diffs) = &all_differences[i];
-            writeln!(report_file, "{} = {}:", sorting_column, sorting_value)?;
+            let (composite_key, row_diffs) = &all_differences[i];
+            writeln!(report_file, "{}:", composite_key)?;
             for (col_name, val1, val2) in row_diffs {
                 writeln!(report_file, "  Column '{}':", col_name)?;
                 writeln!(report_file, "    File 1: {}", val1)?;
