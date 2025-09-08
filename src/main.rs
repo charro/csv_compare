@@ -372,7 +372,7 @@ fn get_rows_num(lazy_frame: &LazyFrame) -> u32 {
 
 /// Finds differences between two CSV files and generates a detailed report
 /// Assumes both files have the same column names and same number of rows
-/// Processes files in batches to handle large files efficiently
+/// Uses temporary sorted files for efficient line-by-line comparison
 /// Only compares columns that are known to have differences for efficiency
 fn find_differences_and_generate_report(
     file1_path: &str,
@@ -382,7 +382,7 @@ fn find_differences_and_generate_report(
     batch_size: Option<usize>,
     columns_with_differences: &HashSet<String>, // Only compare these columns
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let batch_size = batch_size.unwrap_or(50000);
+    use std::io::{BufRead, BufReader, BufWriter};
 
     // Create lazy frames for both files
     let mut lf1 = LazyCsvReader::new(file1_path)
@@ -403,17 +403,35 @@ fn find_differences_and_generate_report(
         lf2 = lf2.sort(sort_col, SortOptions::default());
     }
 
-    // Get total row count and all column names
-    let total_rows = lf1.clone().select([col(&sorting_columns[0])]).collect()?.height();
+    // Get all column names to understand the structure
     let all_column_names = get_column_names(&lf1);
+    let total_rows = lf1.clone().select([col(&sorting_columns[0])]).collect()?.height();
 
-    // Create list of columns to compare (sorting columns + columns with differences)
-    let mut columns_to_check = sorting_columns.clone();
+    println!("Creating temporary sorted files for efficient comparison...");
+
+    // Create list of columns we need for comparison (sorting + difference columns)
+    let mut columns_to_export = sorting_columns.clone();
     for col_name in &all_column_names {
         if columns_with_differences.contains(col_name) && !sorting_columns.contains(col_name) {
-            columns_to_check.push(col_name.clone());
+            columns_to_export.push(col_name.clone());
         }
     }
+
+    let temp_dir = std::env::temp_dir();
+    let temp_file1 = temp_dir.join(format!("csv_compare_temp1_{}.csv", std::process::id()));
+    let temp_file2 = temp_dir.join(format!("csv_compare_temp2_{}.csv", std::process::id()));
+
+    // Export sorted data to temporary files
+    let columns_to_select: Vec<_> = columns_to_export.iter().map(|s| col(s)).collect();
+
+    let df1_sorted = lf1.select(columns_to_select.clone()).collect()?;
+    let df2_sorted = lf2.select(columns_to_select).collect()?;
+
+    // Write temporary CSV files manually for better control
+    write_dataframe_to_csv(&df1_sorted, &temp_file1, separator)?;
+    write_dataframe_to_csv(&df2_sorted, &temp_file2, separator)?;
+
+    println!("Temporary files created. Starting line-by-line comparison...");
 
     // Generate report filename using file names
     let file1_name = Path::new(file1_path)
@@ -443,92 +461,126 @@ fn find_differences_and_generate_report(
     writeln!(report_file, "Total Rows: {}", total_rows)?;
     writeln!(report_file, "Total Columns: {}", all_column_names.len())?;
     writeln!(report_file, "Columns with differences: {:?}", columns_with_differences.iter().collect::<Vec<_>>())?;
-    writeln!(report_file, "Batch Size: {}", batch_size)?;
     writeln!(report_file, "")?;
 
-    // Collect all differences first
-    let mut all_differences = Vec::new();
+    // Now do fast line-by-line comparison
+    let file1_reader = BufReader::new(std::fs::File::open(&temp_file1)?);
+    let file2_reader = BufReader::new(std::fs::File::open(&temp_file2)?);
 
-    let mut total_differences = 0;
-    let mut rows_with_differences = 0;
+    let mut file1_lines = file1_reader.lines();
+    let mut file2_lines = file2_reader.lines();
 
-    // Create progress bar for large files
+    // Skip headers
+    let header1 = file1_lines.next().unwrap()?;
+    let header2 = file2_lines.next().unwrap()?;
+
+    // Parse headers to know column positions
+    let header1_cols: Vec<&str> = header1.split(separator).collect();
+    let header2_cols: Vec<&str> = header2.split(separator).collect();
+
+    // Find column indices for sorting columns and difference columns
+    let mut sorting_indices = Vec::new();
+    let mut diff_column_indices = Vec::new();
+    let mut diff_column_names_ordered = Vec::new();
+
+    for sort_col in sorting_columns {
+        if let Some(pos) = header1_cols.iter().position(|&x| x == sort_col) {
+            sorting_indices.push(pos);
+        }
+    }
+
+    for col_name in columns_with_differences {
+        if let Some(pos) = header1_cols.iter().position(|&x| x == col_name) {
+            diff_column_indices.push(pos);
+            diff_column_names_ordered.push(col_name.clone());
+        }
+    }
+
+    // Progress tracking
     let progress_bar = if total_rows > 50000 {
         let pb = ProgressBar::new(total_rows as u64);
         pb.set_style(
             ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg} {per_sec}")
                 .expect("Error creating progress bar")
         );
-        pb.set_message("Analyzing differences");
+        pb.set_message("Comparing lines");
         Some(pb)
     } else {
         None
     };
 
-    // Process files in batches
-    for batch_start in (0..total_rows).step_by(batch_size) {
-        let batch_end = std::cmp::min(batch_start + batch_size, total_rows);
-        let current_batch_size = batch_end - batch_start;
+    let mut all_differences = Vec::new();
+    let mut total_differences = 0;
+    let mut rows_with_differences = 0;
+    let mut line_num = 0;
 
-        // Load current batch from both files, but only the columns we need to check
-        let columns_to_select: Vec<_> = columns_to_check.iter().map(|s| col(s)).collect();
+    // Compare lines efficiently
+    loop {
+        let line1_result = file1_lines.next();
+        let line2_result = file2_lines.next();
 
-        let df1_batch = lf1.clone()
-            .select(columns_to_select.clone())
-            .slice(batch_start as i64, current_batch_size as u32)
-            .collect()?;
+        match (line1_result, line2_result) {
+            (Some(Ok(line1)), Some(Ok(line2))) => {
+                line_num += 1;
 
-        let df2_batch = lf2.clone()
-            .select(columns_to_select)
-            .slice(batch_start as i64, current_batch_size as u32)
-            .collect()?;
+                let cols1: Vec<&str> = line1.split(separator).collect();
+                let cols2: Vec<&str> = line2.split(separator).collect();
 
-        // Use the original approach but with direct get() calls - this is actually faster
-        for batch_row_idx in 0..current_batch_size {
-            let mut row_differences = Vec::new();
+                // Build composite key for identification
+                let mut sorting_values = Vec::new();
+                for &idx in &sorting_indices {
+                    if idx < cols1.len() {
+                        let col_name = &sorting_columns[sorting_indices.iter().position(|&x| x == idx).unwrap()];
+                        sorting_values.push(format!("{} = {}", col_name, cols1[idx]));
+                    }
+                }
+                let composite_key = sorting_values.join(", ");
 
-            // Get the sorting column values for this row (used for identification)
-            let mut sorting_values = Vec::new();
-            for sort_col in sorting_columns {
-                let sorting_col1 = df1_batch.column(sort_col).unwrap();
-                let sorting_value = sorting_col1.get(batch_row_idx).unwrap().to_string();
-                sorting_values.push(format!("{} = {}", sort_col, sorting_value));
-            }
-            let composite_key = sorting_values.join(", ");
+                // Compare difference columns
+                let mut row_differences = Vec::new();
+                for (i, &col_idx) in diff_column_indices.iter().enumerate() {
+                    if col_idx < cols1.len() && col_idx < cols2.len() {
+                        let val1 = cols1[col_idx];
+                        let val2 = cols2[col_idx];
 
-            // Compare only the columns that we know have differences
-            for col_name in columns_with_differences {
-                // Get values from both dataframes using column access
-                let col1 = df1_batch.column(col_name).unwrap();
-                let col2 = df2_batch.column(col_name).unwrap();
+                        if val1 != val2 {
+                            row_differences.push((diff_column_names_ordered[i].clone(), val1.to_string(), val2.to_string()));
+                            total_differences += 1;
+                        }
+                    }
+                }
 
-                let val1 = col1.get(batch_row_idx).unwrap();
-                let val2 = col2.get(batch_row_idx).unwrap();
+                if !row_differences.is_empty() {
+                    rows_with_differences += 1;
+                    all_differences.push((composite_key, row_differences));
+                }
 
-                // Check if values are different (already strings due to infer_schema_length=0)
-                if val1 != val2 {
-                    row_differences.push((col_name.clone(), val1.to_string(), val2.to_string()));
-                    total_differences += 1;
+                // Update progress every 1000 lines for better performance
+                if let Some(ref pb) = progress_bar {
+                    if line_num % 1000 == 0 {
+                        pb.inc(1000);
+                    }
                 }
             }
-
-            // If this row has differences, collect them
-            if !row_differences.is_empty() {
-                rows_with_differences += 1;
-                all_differences.push((composite_key, row_differences));
+            (None, None) => break, // Both files ended
+            _ => {
+                // This shouldn't happen if files have same number of rows
+                break;
             }
         }
-
-        // Update progress bar if it exists
-        if let Some(ref pb) = progress_bar {
-            pb.inc(current_batch_size as u64);
-        }
     }
 
-    // Finish progress bar if it exists
-    if let Some(pb) = progress_bar {
-        pb.finish_with_message("Analysis complete");
+    // Update progress bar to completion
+    if let Some(ref pb) = progress_bar {
+        pb.set_position(total_rows as u64);
+        pb.finish_with_message("Comparison complete");
     }
+
+    // Clean up temporary files
+    let _ = std::fs::remove_file(&temp_file1);
+    let _ = std::fs::remove_file(&temp_file2);
+
+    println!("Temporary files cleaned up. Generating report...");
 
     // Decide on output format and create files accordingly
     let mut csv_file_created = false;
@@ -567,17 +619,10 @@ fn find_differences_and_generate_report(
 
         // Helper function to escape CSV values properly
         let escape_csv = |s: &str| -> String {
-            // Remove surrounding quotes if they exist (from polars string conversion)
-            let cleaned = if s.starts_with('"') && s.ends_with('"') && s.len() > 1 {
-                &s[1..s.len()-1]
+            if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+                format!("\"{}\"", s.replace("\"", "\"\""))
             } else {
-                s
-            };
-
-            if cleaned.contains(',') || cleaned.contains('"') || cleaned.contains('\n') || cleaned.contains('\r') {
-                format!("\"{}\"", cleaned.replace("\"", "\"\""))
-            } else {
-                cleaned.to_string()
+                s.to_string()
             }
         };
 
@@ -642,4 +687,45 @@ fn find_differences_and_generate_report(
 
     // Return the main report filename (caller can infer CSV filename if needed)
     Ok(report_filename)
+}
+
+/// Helper function to write a DataFrame to CSV manually
+fn write_dataframe_to_csv(
+    df: &DataFrame,
+    file_path: &Path,
+    separator: char
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::BufWriter;
+
+    let file = std::fs::File::create(file_path)?;
+    let mut writer = BufWriter::new(file);
+
+    // Write header
+    let column_names = df.get_column_names();
+    writeln!(writer, "{}", column_names.join(&separator.to_string()))?;
+
+    // Write data rows
+    let height = df.height();
+    for row_idx in 0..height {
+        let mut row_values = Vec::new();
+
+        for col_name in &column_names {
+            let col = df.column(col_name).unwrap();
+            let value = col.get(row_idx).unwrap().to_string();
+
+            // Handle CSV escaping
+            let escaped_value = if value.contains(separator) || value.contains('"') || value.contains('\n') {
+                format!("\"{}\"", value.replace("\"", "\"\""))
+            } else {
+                value
+            };
+
+            row_values.push(escaped_value);
+        }
+
+        writeln!(writer, "{}", row_values.join(&separator.to_string()))?;
+    }
+
+    writer.flush()?;
+    Ok(())
 }
