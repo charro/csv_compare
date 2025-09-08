@@ -98,6 +98,9 @@ fn main() {
 
     let number_of_columns_to_compare = args.number_of_columns;
     let mut columns_to_compare = vec![];
+    let mut columns_with_differences = HashSet::new(); // Track columns that have differences
+    let mut files_are_different = false; // Track if any differences were found
+
     for i in 1..first_file_cols.len() {
         let column_name = &first_file_cols[i];
         columns_to_compare.push(column_name);
@@ -118,38 +121,20 @@ fn main() {
             );
 
             if !first_data_frame.equals_missing(&second_data_frame) {
-                let column_names = columns_to_compare
-                    .iter()
-                    .copied()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>()
-                    .join(" | ");
+                files_are_different = true;
 
-                println!(
-                    "{}: {} \n {} \n {}",
-                    "FILES ARE DIFFERENT".red(),
-                    "Values for column(s)".red(),
-                    column_names.red().bold(),
-                    "are different".red()
-                );
+                // Find which specific columns have differences
+                for col_name in &columns_to_compare {
+                    if *col_name != sorting_column {
+                        let col1 = first_data_frame.column(col_name).unwrap();
+                        let col2 = second_data_frame.column(col_name).unwrap();
 
-                // Generate report if requested
-                if args.report {
-                    println!("{}", "Generating detailed report of differences...".yellow());
-                    if let Ok(report_file) = find_differences_and_generate_report(
-                        first_file_path,
-                        second_file_path,
-                        separator,
-                        sorting_column,
-                        Some(args.number_of_columns * 1000), // Use a reasonable batch size
-                    ) {
-                        println!("Report saved to: {}", report_file.green());
-                    } else {
-                        println!("{}", "Failed to generate report file".red());
+                        // Check if this specific column has differences
+                        if col1 != col2 {
+                            columns_with_differences.insert(col_name.to_string());
+                        }
                     }
                 }
-
-                exit(3);
             }
             progress_bar.inc(columns_to_compare.len() as u64);
             columns_to_compare.clear();
@@ -157,13 +142,57 @@ fn main() {
     }
     progress_bar.finish();
 
-    println!(
-        "Files {} and {} {} {}",
-        first_file_path.bold(),
-        second_file_path.bold(),
-        "ARE IDENTICAL WHEN SORTED BY COLUMN:".green(),
-        sorting_column.green()
-    );
+    // Now check if files are different and handle accordingly
+    if files_are_different {
+        // Convert HashSet to sorted Vec for consistent output
+        let mut diff_columns: Vec<String> = columns_with_differences.iter().cloned().collect();
+        diff_columns.sort();
+
+        println!(
+            "{}: {}",
+            "FILES ARE DIFFERENT".red(),
+            "The following columns have differences:".red()
+        );
+
+        for col_name in &diff_columns {
+            println!("  • {}", col_name.yellow().bold());
+        }
+
+        println!(
+            "\n{} {} {} {}",
+            "Total columns with differences:".red(),
+            diff_columns.len().to_string().red().bold(),
+            "out of".red(),
+            (first_file_cols.len() - 1).to_string().red().bold() // Exclude sorting column
+        );
+
+        // Generate report if requested
+        if args.report {
+            println!("\n{}", "Generating detailed report of differences...".yellow());
+            if let Ok(report_file) = find_differences_and_generate_report(
+                first_file_path,
+                second_file_path,
+                separator,
+                sorting_column,
+                Some(args.number_of_columns * 1000), // Use a reasonable batch size
+                &columns_with_differences, // Pass the columns that have differences
+            ) {
+                println!("Report saved to: {}", report_file.green());
+            } else {
+                println!("{}", "Failed to generate report file".red());
+            }
+        }
+
+        exit(3);
+    } else {
+        println!(
+            "Files {} and {} {} {}",
+            first_file_path.bold(),
+            second_file_path.bold(),
+            "ARE IDENTICAL WHEN SORTED BY COLUMN:".green(),
+            sorting_column.green()
+        );
+    }
 }
 
 fn assert_both_frames_have_same_row_num(
@@ -236,12 +265,15 @@ fn assert_both_frames_are_comparable(
             println!("{}", "Generating detailed report of differences...".yellow());
             // Get the first column name from the first file for sorting
             let first_col_name = first_file_cols[0].clone();
+            // For column differences, we need to compare all columns
+            let all_columns: HashSet<String> = first_file_cols.iter().skip(1).cloned().collect();
             if let Ok(report_file) = find_differences_and_generate_report(
                 file1_path,
                 file2_path,
                 args.separator,
                 &first_col_name,
                 Some(20000), // Default batch size
+                &all_columns, // Compare all columns when column structure is different
             ) {
                 println!("Report saved to: {}", report_file.green());
             } else {
@@ -305,17 +337,22 @@ fn get_rows_num(lazy_frame: &LazyFrame) -> u32 {
         .0 as u32;
 }
 
+
 /// Finds differences between two CSV files and generates a detailed report
 /// Assumes both files have the same column names and same number of rows
 /// Processes files in batches to handle large files efficiently
+/// Only compares columns that are known to have differences for efficiency
 fn find_differences_and_generate_report(
     file1_path: &str,
     file2_path: &str,
     separator: char,
     sorting_column: &str,
     batch_size: Option<usize>,
+    columns_with_differences: &HashSet<String>, // Only compare these columns
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let batch_size = batch_size.unwrap_or(20000); // Default batch size of 20k rows
+    use polars::prelude::*;
+
+    let batch_size = batch_size.unwrap_or(100000); // Even larger batch size
 
     // Create lazy frames for both files
     let lf1 = LazyCsvReader::new(file1_path)
@@ -332,10 +369,17 @@ fn find_differences_and_generate_report(
         .finish()?
         .sort(sorting_column, SortOptions::default());
 
-    // Get total row count and column names from first batch
-    let first_batch1 = lf1.clone().limit(batch_size as u32).collect()?;
+    // Get total row count and all column names
     let total_rows = lf1.clone().select([col(sorting_column)]).collect()?.height();
-    let column_names = first_batch1.get_column_names();
+    let all_column_names = get_column_names(&lf1);
+
+    // Create list of columns to compare (sorting column + columns with differences)
+    let mut columns_to_check = vec![sorting_column.to_string()];
+    for col_name in &all_column_names {
+        if columns_with_differences.contains(col_name) && col_name != sorting_column {
+            columns_to_check.push(col_name.clone());
+        }
+    }
 
     // Generate report filename using file names
     let file1_name = Path::new(file1_path)
@@ -363,7 +407,8 @@ fn find_differences_and_generate_report(
     writeln!(report_file, "File 2: {}", file2_path)?;
     writeln!(report_file, "Sorting Column: {}", sorting_column)?;
     writeln!(report_file, "Total Rows: {}", total_rows)?;
-    writeln!(report_file, "Total Columns: {}", column_names.len())?;
+    writeln!(report_file, "Total Columns: {}", all_column_names.len())?;
+    writeln!(report_file, "Columns with differences: {:?}", columns_with_differences.iter().collect::<Vec<_>>())?;
     writeln!(report_file, "Batch Size: {}", batch_size)?;
     writeln!(report_file, "")?;
 
@@ -372,16 +417,15 @@ fn find_differences_and_generate_report(
 
     let mut total_differences = 0;
     let mut rows_with_differences = 0;
-    let mut global_row_idx = 0;
 
     // Create progress bar for large files
-    let progress_bar = if total_rows > 100000 {
+    let progress_bar = if total_rows > 50000 {
         let pb = ProgressBar::new(total_rows as u64);
         pb.set_style(
-            ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
+            ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg} {per_sec}")
                 .expect("Error creating progress bar")
         );
-        pb.set_message("Comparing CSV files...");
+        pb.set_message("Analyzing differences");
         Some(pb)
     } else {
         None
@@ -392,57 +436,79 @@ fn find_differences_and_generate_report(
         let batch_end = std::cmp::min(batch_start + batch_size, total_rows);
         let current_batch_size = batch_end - batch_start;
 
-        // Load current batch from both files
+        // Load current batch from both files, but only the columns we need to check
+        let columns_to_select: Vec<_> = columns_to_check.iter().map(|s| col(s)).collect();
+
         let df1_batch = lf1.clone()
+            .select(columns_to_select.clone())
             .slice(batch_start as i64, current_batch_size as u32)
             .collect()?;
 
         let df2_batch = lf2.clone()
+            .select(columns_to_select)
             .slice(batch_start as i64, current_batch_size as u32)
             .collect()?;
 
-        // Compare each row in the current batch
-        for batch_row_idx in 0..current_batch_size {
-            let mut row_differences = Vec::new();
+        // Convert columns to string vectors for faster access
+        let sorting_col1 = df1_batch.column(sorting_column)?.str()?.into_iter().collect::<Vec<_>>();
 
-            // Get the sorting column value for this row (used for identification)
-            let sorting_col1 = df1_batch.column(sorting_column).unwrap();
-            let sorting_value = sorting_col1.get(batch_row_idx).unwrap().to_string();
+        // Pre-convert all columns to string vectors for maximum performance
+        let mut cols1_data = Vec::new();
+        let mut cols2_data = Vec::new();
+        let diff_col_names: Vec<String> = columns_with_differences.iter().cloned().collect();
 
-            // Compare each column in the current row
-            for col_name in &column_names {
-                // Get values from both dataframes using column access
-                let col1 = df1_batch.column(col_name).unwrap();
-                let col2 = df2_batch.column(col_name).unwrap();
+        for col_name in &diff_col_names {
+            let col1_strings = df1_batch.column(col_name)?.str()?.into_iter().collect::<Vec<_>>();
+            let col2_strings = df2_batch.column(col_name)?.str()?.into_iter().collect::<Vec<_>>();
+            cols1_data.push(col1_strings);
+            cols2_data.push(col2_strings);
+        }
 
-                let val1 = col1.get(batch_row_idx).unwrap();
-                let val2 = col2.get(batch_row_idx).unwrap();
+        // Process rows in chunks for better cache efficiency
+        const CHUNK_SIZE: usize = 1000;
+        for chunk_start in (0..current_batch_size).step_by(CHUNK_SIZE) {
+            let chunk_end = std::cmp::min(chunk_start + CHUNK_SIZE, current_batch_size);
 
-                // Check if values are different (already strings due to infer_schema_length=0)
-                if val1 != val2 {
-                    row_differences.push((col_name.to_string(), val1.to_string(), val2.to_string()));
-                    total_differences += 1;
+            for row_idx in chunk_start..chunk_end {
+                let mut row_differences = Vec::new();
+
+                // Get sorting value - handle potential None values
+                let sorting_value = sorting_col1[row_idx]
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "NULL".to_string());
+
+                // Compare columns efficiently
+                for (col_idx, col_name) in diff_col_names.iter().enumerate() {
+                    let val1 = cols1_data[col_idx][row_idx]
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "NULL".to_string());
+                    let val2 = cols2_data[col_idx][row_idx]
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "NULL".to_string());
+
+                    if val1 != val2 {
+                        row_differences.push((col_name.clone(), val1, val2));
+                        total_differences += 1;
+                    }
+                }
+
+                // If this row has differences, collect them
+                if !row_differences.is_empty() {
+                    rows_with_differences += 1;
+                    all_differences.push((batch_start + row_idx + 1, sorting_value, row_differences));
                 }
             }
 
-            // If this row has differences, collect them
-            if !row_differences.is_empty() {
-                rows_with_differences += 1;
-                all_differences.push((global_row_idx + 1, sorting_value, row_differences));
-            }
-
-            global_row_idx += 1;
-
-            // Update progress bar if it exists
+            // Update progress more frequently for better feedback
             if let Some(ref pb) = progress_bar {
-                pb.inc(1);
+                pb.inc((chunk_end - chunk_start) as u64);
             }
         }
     }
 
     // Finish progress bar if it exists
     if let Some(pb) = progress_bar {
-        pb.finish();
+        pb.finish_with_message("Analysis complete");
     }
 
     // Decide on output format and create files accordingly
@@ -472,41 +538,38 @@ fn find_differences_and_generate_report(
         writeln!(report_file, "========================================================")?;
         writeln!(report_file, "")?;
 
-        // Create CSV file
-        let mut csv_file = File::create(&csv_filename)?;
+        // Create CSV file with buffered writing for better performance
+        let csv_file = File::create(&csv_filename)?;
+        let mut csv_writer = std::io::BufWriter::with_capacity(65536, csv_file); // 64KB buffer
         csv_file_created = true;
 
         // Write CSV header
-        writeln!(csv_file, "Row,Sorting_Value,Column,File_1_Value,File_2_Value")?;
+        writeln!(csv_writer, "Row,Sorting_Value,Column,File_1_Value,File_2_Value")?;
 
         // Helper function to escape CSV values properly
         let escape_csv = |s: &str| -> String {
-            // Remove surrounding quotes if they exist (from polars string conversion)
-            let cleaned = if s.starts_with('"') && s.ends_with('"') && s.len() > 1 {
-                &s[1..s.len()-1]
+            if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+                format!("\"{}\"", s.replace("\"", "\"\""))
             } else {
-                s
-            };
-
-            if cleaned.contains(',') || cleaned.contains('"') || cleaned.contains('\n') || cleaned.contains('\r') {
-                format!("\"{}\"", cleaned.replace("\"", "\"\""))
-            } else {
-                cleaned.to_string()
+                s.to_string()
             }
         };
 
-        // Write all differences to CSV
+        // Write all differences to CSV efficiently
         for (row_num, sorting_value, row_diffs) in &all_differences {
             for (col_name, val1, val2) in row_diffs {
-                writeln!(csv_file, "{},{},{},{},{}",
-                    row_num,
-                    escape_csv(sorting_value),
-                    escape_csv(col_name),
-                    escape_csv(val1),
-                    escape_csv(val2)
+                writeln!(csv_writer, "{},{},{},{},{}",
+                         row_num,
+                         escape_csv(sorting_value),
+                         escape_csv(col_name),
+                         escape_csv(val1),
+                         escape_csv(val2)
                 )?;
             }
         }
+
+        // Ensure all data is written
+        csv_writer.flush()?;
 
         // Show a sample of first few differences in the text report
         writeln!(report_file, "Sample of first 10 differences (see {} for complete list):", csv_filename)?;
@@ -527,7 +590,7 @@ fn find_differences_and_generate_report(
 
         if all_differences.len() > sample_count {
             writeln!(report_file, "... and {} more rows with differences (see CSV file for complete details)",
-                all_differences.len() - sample_count)?;
+                     all_differences.len() - sample_count)?;
             writeln!(report_file, "")?;
         }
     }
@@ -571,8 +634,19 @@ mod tests {
         fs::write("test1.csv", csv1_content).unwrap();
         fs::write("test2.csv", csv2_content).unwrap();
 
+        // Create columns with differences for testing
+        let mut columns_with_differences = HashSet::new();
+        columns_with_differences.insert("age".to_string());
+
         // Test the function
-        let result = find_differences_and_generate_report("test1.csv", "test2.csv", ',', "id", Some(1000));
+        let result = find_differences_and_generate_report(
+            "test1.csv",
+            "test2.csv",
+            ',',
+            "id",
+            Some(1000),
+            &columns_with_differences
+        );
 
         // Clean up test files
         fs::remove_file("test1.csv").unwrap_or_default();
@@ -595,6 +669,7 @@ mod tests {
         assert!(report_content.contains("CSV Differences Report"));
         assert!(report_content.contains("File 1: test1.csv"));
         assert!(report_content.contains("File 2: test2.csv"));
+        assert!(report_content.contains("Columns with differences"));
         assert!(report_content.contains("Row 1 (id = \"1\")"));
         assert!(report_content.contains("Row 3 (id = \"3\")"));
         assert!(report_content.contains("age"));
@@ -623,8 +698,19 @@ mod tests {
         fs::write("large_test1.csv", csv1_content).unwrap();
         fs::write("large_test2.csv", csv2_content).unwrap();
 
+        // Create columns with differences for testing
+        let mut columns_with_differences = HashSet::new();
+        columns_with_differences.insert("age".to_string());
+
         // Test the function with a small batch size to see progress updates
-        let result = find_differences_and_generate_report("large_test1.csv", "large_test2.csv", ',', "id", Some(1000));
+        let result = find_differences_and_generate_report(
+            "large_test1.csv",
+            "large_test2.csv",
+            ',',
+            "id",
+            Some(1000),
+            &columns_with_differences
+        );
 
         // Clean up test files
         fs::remove_file("large_test1.csv").unwrap_or_default();
@@ -643,10 +729,9 @@ mod tests {
         assert!(report_content.contains("CSV Differences Report"));
         assert!(report_content.contains("Total Rows: 150000"));
         assert!(report_content.contains("Batch Size: 1000"));
+        assert!(report_content.contains("Columns with differences"));
 
         // Clean up report file
         fs::remove_file(&report_file).unwrap_or_default();
     }
 }
-
-
