@@ -315,8 +315,8 @@ fn find_differences_and_generate_report(
     sorting_column: &str,
     batch_size: Option<usize>,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let batch_size = batch_size.unwrap_or(20000); // Default batch size of 10k rows
-    
+    let batch_size = batch_size.unwrap_or(20000); // Default batch size of 20k rows
+
     // Create lazy frames for both files
     let lf1 = LazyCsvReader::new(file1_path)
         .has_header(true)
@@ -336,7 +336,7 @@ fn find_differences_and_generate_report(
     let first_batch1 = lf1.clone().limit(batch_size as u32).collect()?;
     let total_rows = lf1.clone().select([col(sorting_column)]).collect()?.height();
     let column_names = first_batch1.get_column_names();
-    
+
     // Generate report filename using file names
     let file1_name = Path::new(file1_path)
         .file_stem()
@@ -346,15 +346,16 @@ fn find_differences_and_generate_report(
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("file2");
-    
+
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)?
         .as_secs();
     let report_filename = format!("csv_diff_{}_vs_{}_{}.txt", file1_name, file2_name, timestamp);
-    
+    let csv_filename = format!("csv_diff_{}_vs_{}_{}.csv", file1_name, file2_name, timestamp);
+
     // Create report file
     let mut report_file = File::create(&report_filename)?;
-    
+
     // Write report header
     writeln!(report_file, "CSV Differences Report")?;
     writeln!(report_file, "======================")?;
@@ -365,14 +366,14 @@ fn find_differences_and_generate_report(
     writeln!(report_file, "Total Columns: {}", column_names.len())?;
     writeln!(report_file, "Batch Size: {}", batch_size)?;
     writeln!(report_file, "")?;
-    
-    // Determine if we should use compact format (more than 50 differences)
+
+    // Collect all differences first
     let mut all_differences = Vec::new();
-    
+
     let mut total_differences = 0;
     let mut rows_with_differences = 0;
     let mut global_row_idx = 0;
-    
+
     // Create progress bar for large files
     let progress_bar = if total_rows > 100000 {
         let pb = ProgressBar::new(total_rows as u64);
@@ -385,66 +386,68 @@ fn find_differences_and_generate_report(
     } else {
         None
     };
-    
+
     // Process files in batches
     for batch_start in (0..total_rows).step_by(batch_size) {
         let batch_end = std::cmp::min(batch_start + batch_size, total_rows);
         let current_batch_size = batch_end - batch_start;
-        
+
         // Load current batch from both files
         let df1_batch = lf1.clone()
             .slice(batch_start as i64, current_batch_size as u32)
             .collect()?;
-            
+
         let df2_batch = lf2.clone()
             .slice(batch_start as i64, current_batch_size as u32)
             .collect()?;
-        
+
         // Compare each row in the current batch
         for batch_row_idx in 0..current_batch_size {
             let mut row_differences = Vec::new();
-            
+
             // Get the sorting column value for this row (used for identification)
             let sorting_col1 = df1_batch.column(sorting_column).unwrap();
             let sorting_value = sorting_col1.get(batch_row_idx).unwrap().to_string();
-            
+
             // Compare each column in the current row
             for col_name in &column_names {
                 // Get values from both dataframes using column access
                 let col1 = df1_batch.column(col_name).unwrap();
                 let col2 = df2_batch.column(col_name).unwrap();
-                
+
                 let val1 = col1.get(batch_row_idx).unwrap();
                 let val2 = col2.get(batch_row_idx).unwrap();
-                
+
                 // Check if values are different (already strings due to infer_schema_length=0)
                 if val1 != val2 {
                     row_differences.push((col_name.to_string(), val1.to_string(), val2.to_string()));
                     total_differences += 1;
                 }
             }
-            
+
             // If this row has differences, collect them
             if !row_differences.is_empty() {
                 rows_with_differences += 1;
                 all_differences.push((global_row_idx + 1, sorting_value, row_differences));
             }
-            
+
             global_row_idx += 1;
-            
+
             // Update progress bar if it exists
             if let Some(ref pb) = progress_bar {
                 pb.inc(1);
             }
         }
     }
-    
+
     // Finish progress bar if it exists
     if let Some(pb) = progress_bar {
         pb.finish();
     }
-    
-    // Write differences in appropriate format
+
+    // Decide on output format and create files accordingly
+    let mut csv_file_created = false;
+
     if total_differences == 0 {
         writeln!(report_file, "✅ Files are identical!")?;
     } else if total_differences <= 50 {
@@ -452,8 +455,8 @@ fn find_differences_and_generate_report(
         writeln!(report_file, "Differences found:")?;
         writeln!(report_file, "==================")?;
         writeln!(report_file, "")?;
-        
-        for (row_num, sorting_value, row_diffs) in all_differences {
+
+        for (row_num, sorting_value, row_diffs) in &all_differences {
             writeln!(report_file, "Row {} ({} = {}):", row_num, sorting_column, sorting_value)?;
             for (col_name, val1, val2) in row_diffs {
                 writeln!(report_file, "  Column '{}':", col_name)?;
@@ -463,60 +466,93 @@ fn find_differences_and_generate_report(
             writeln!(report_file, "")?;
         }
     } else {
-        // Use compact CSV format for large number of differences
-        writeln!(report_file, "Differences found (CSV format for easy import into Excel/other tools):")?;
-        writeln!(report_file, "=================================================================")?;
+        // Create separate CSV file for many differences
+        writeln!(report_file, "Many differences found ({} total differences).", total_differences)?;
+        writeln!(report_file, "Creating separate CSV file for detailed analysis: {}", csv_filename)?;
+        writeln!(report_file, "========================================================")?;
         writeln!(report_file, "")?;
-        
+
+        // Create CSV file
+        let mut csv_file = File::create(&csv_filename)?;
+        csv_file_created = true;
+
         // Write CSV header
-        writeln!(report_file, "Row,Sorting_Value,Column,File_1_Value,File_2_Value")?;
-        
-        for (row_num, sorting_value, row_diffs) in all_differences {
+        writeln!(csv_file, "Row,Sorting_Value,Column,File_1_Value,File_2_Value")?;
+
+        // Helper function to escape CSV values properly
+        let escape_csv = |s: &str| -> String {
+            // Remove surrounding quotes if they exist (from polars string conversion)
+            let cleaned = if s.starts_with('"') && s.ends_with('"') && s.len() > 1 {
+                &s[1..s.len()-1]
+            } else {
+                s
+            };
+
+            if cleaned.contains(',') || cleaned.contains('"') || cleaned.contains('\n') || cleaned.contains('\r') {
+                format!("\"{}\"", cleaned.replace("\"", "\"\""))
+            } else {
+                cleaned.to_string()
+            }
+        };
+
+        // Write all differences to CSV
+        for (row_num, sorting_value, row_diffs) in &all_differences {
             for (col_name, val1, val2) in row_diffs {
-                // Escape CSV values (handle quotes and commas)
-                let escape_csv = |s: &str| -> String {
-                    // Remove surrounding quotes if they exist (from polars string conversion)
-                    let cleaned = if s.starts_with('"') && s.ends_with('"') && s.len() > 1 {
-                        &s[1..s.len()-1]
-                    } else {
-                        s
-                    };
-                    
-                    if cleaned.contains(',') || cleaned.contains('"') || cleaned.contains('\n') {
-                        format!("\"{}\"", cleaned.replace("\"", "\"\""))
-                    } else {
-                        cleaned.to_string()
-                    }
-                };
-                
-                writeln!(report_file, "{},{},{},{},{}", 
-                    row_num, 
-                    escape_csv(&sorting_value),
-                    escape_csv(&col_name),
-                    escape_csv(&val1),
-                    escape_csv(&val2)
+                writeln!(csv_file, "{},{},{},{},{}",
+                    row_num,
+                    escape_csv(sorting_value),
+                    escape_csv(col_name),
+                    escape_csv(val1),
+                    escape_csv(val2)
                 )?;
             }
         }
+
+        // Show a sample of first few differences in the text report
+        writeln!(report_file, "Sample of first 10 differences (see {} for complete list):", csv_filename)?;
+        writeln!(report_file, "=================================================================")?;
         writeln!(report_file, "")?;
+
+        let sample_count = std::cmp::min(10, all_differences.len());
+        for i in 0..sample_count {
+            let (row_num, sorting_value, row_diffs) = &all_differences[i];
+            writeln!(report_file, "Row {} ({} = {}):", row_num, sorting_column, sorting_value)?;
+            for (col_name, val1, val2) in row_diffs {
+                writeln!(report_file, "  Column '{}':", col_name)?;
+                writeln!(report_file, "    File 1: {}", val1)?;
+                writeln!(report_file, "    File 2: {}", val2)?;
+            }
+            writeln!(report_file, "")?;
+        }
+
+        if all_differences.len() > sample_count {
+            writeln!(report_file, "... and {} more rows with differences (see CSV file for complete details)",
+                all_differences.len() - sample_count)?;
+            writeln!(report_file, "")?;
+        }
     }
-    
+
     // Write summary
     writeln!(report_file, "Summary:")?;
     writeln!(report_file, "=========")?;
     writeln!(report_file, "Total rows with differences: {}", rows_with_differences)?;
     writeln!(report_file, "Total individual cell differences: {}", total_differences)?;
     writeln!(report_file, "Rows without differences: {}", total_rows - rows_with_differences)?;
-    
+
+    if csv_file_created {
+        writeln!(report_file, "Detailed differences exported to: {}", csv_filename)?;
+    }
+
     if total_differences > 0 {
         writeln!(report_file, "")?;
         if total_differences <= 50 {
             writeln!(report_file, "❌ Files have differences as listed above.")?;
         } else {
-            writeln!(report_file, "❌ Files have many differences. Using CSV format for easy import into Excel/other tools.")?;
+            writeln!(report_file, "❌ Files have many differences. See {} for detailed analysis in Excel.", csv_filename)?;
         }
     }
-    
+
+    // Return the main report filename (caller can infer CSV filename if needed)
     Ok(report_filename)
 }
 
@@ -524,36 +560,36 @@ fn find_differences_and_generate_report(
 mod tests {
     use super::*;
     use std::fs;
-    
+
     #[test]
     fn test_find_differences_and_generate_report() {
         // Create two simple test CSV files
         let csv1_content = "id,name,age\n1,Alice,25\n2,Bob,30\n3,Charlie,35";
         let csv2_content = "id,name,age\n1,Alice,26\n2,Bob,30\n3,Charlie,36";
-        
+
         // Write test files
         fs::write("test1.csv", csv1_content).unwrap();
         fs::write("test2.csv", csv2_content).unwrap();
-        
+
         // Test the function
         let result = find_differences_and_generate_report("test1.csv", "test2.csv", ',', "id", Some(1000));
-        
+
         // Clean up test files
         fs::remove_file("test1.csv").unwrap_or_default();
         fs::remove_file("test2.csv").unwrap_or_default();
-        
+
         // Check that the function succeeded
         assert!(result.is_ok());
-        
+
         let report_file = result.unwrap();
-        
+
         // Check that the report file was created
         assert!(fs::metadata(&report_file).is_ok());
-        
+
         // Check that the report file was created with the expected naming pattern
         assert!(report_file.starts_with("csv_diff_test1_vs_test2_"));
         assert!(report_file.ends_with(".txt"));
-        
+
         // Read and verify report content
         let report_content = fs::read_to_string(&report_file).unwrap();
         assert!(report_content.contains("CSV Differences Report"));
@@ -566,48 +602,48 @@ mod tests {
         assert!(report_content.contains("26"));
         assert!(report_content.contains("35"));
         assert!(report_content.contains("36"));
-        
+
         // Clean up report file
         fs::remove_file(&report_file).unwrap_or_default();
     }
-    
+
     #[test]
     fn test_progress_bar_for_large_files() {
         // Create larger test CSV files to trigger progress bar
         let mut csv1_content = String::from("id,name,age\n");
         let mut csv2_content = String::from("id,name,age\n");
-        
+
         // Generate 150,000 rows to trigger progress bar (threshold is 100,000)
         for i in 1..=150000 {
             csv1_content.push_str(&format!("{},Alice,25\n", i));
             csv2_content.push_str(&format!("{},Alice,{}\n", i, if i % 2 == 0 { 25 } else { 26 }));
         }
-        
+
         // Write test files
         fs::write("large_test1.csv", csv1_content).unwrap();
         fs::write("large_test2.csv", csv2_content).unwrap();
-        
+
         // Test the function with a small batch size to see progress updates
         let result = find_differences_and_generate_report("large_test1.csv", "large_test2.csv", ',', "id", Some(1000));
-        
+
         // Clean up test files
         fs::remove_file("large_test1.csv").unwrap_or_default();
         fs::remove_file("large_test2.csv").unwrap_or_default();
-        
+
         // Check that the function succeeded
         assert!(result.is_ok());
-        
+
         let report_file = result.unwrap();
-        
+
         // Check that the report file was created
         assert!(fs::metadata(&report_file).is_ok());
-        
+
         // Read and verify report content
         let report_content = fs::read_to_string(&report_file).unwrap();
         assert!(report_content.contains("CSV Differences Report"));
         assert!(report_content.contains("Total Rows: 150000"));
         assert!(report_content.contains("Batch Size: 1000"));
-        
+
         // Clean up report file
         fs::remove_file(&report_file).unwrap_or_default();
     }
