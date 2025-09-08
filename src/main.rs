@@ -370,6 +370,7 @@ fn get_rows_num(lazy_frame: &LazyFrame) -> u32 {
 }
 
 
+
 /// Finds differences between two CSV files and generates a detailed report
 /// Assumes both files have the same column names and same number of rows
 /// Uses temporary sorted files for efficient line-by-line comparison
@@ -379,10 +380,10 @@ fn find_differences_and_generate_report(
     file2_path: &str,
     separator: char,
     sorting_columns: &Vec<String>,
-    batch_size: Option<usize>,
+    _batch_size: Option<usize>,
     columns_with_differences: &HashSet<String>, // Only compare these columns
 ) -> Result<String, Box<dyn std::error::Error>> {
-    use std::io::{BufRead, BufReader, BufWriter};
+    use std::io::{BufRead, BufReader};
 
     // Create lazy frames for both files
     let mut lf1 = LazyCsvReader::new(file1_path)
@@ -472,11 +473,10 @@ fn find_differences_and_generate_report(
 
     // Skip headers
     let header1 = file1_lines.next().unwrap()?;
-    let header2 = file2_lines.next().unwrap()?;
+    let _header2 = file2_lines.next().unwrap()?;
 
     // Parse headers to know column positions
     let header1_cols: Vec<&str> = header1.split(separator).collect();
-    let header2_cols: Vec<&str> = header2.split(separator).collect();
 
     // Find column indices for sorting columns and difference columns
     let mut sorting_indices = Vec::new();
