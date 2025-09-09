@@ -617,12 +617,16 @@ fn find_differences_and_generate_report(
         // Write CSV header - with composite key
         writeln!(csv_writer, "Composite_Key,Column,File_1_Value,File_2_Value")?;
 
-        // Helper function to escape CSV values properly
+        // Improved CSV escaping function
         let escape_csv = |s: &str| -> String {
-            if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
-                format!("\"{}\"", s.replace("\"", "\"\""))
+            // Remove any existing quotes first to avoid double-escaping
+            let cleaned = s.trim_matches('"');
+
+            // Only escape if the value contains special characters
+            if cleaned.contains(',') || cleaned.contains('"') || cleaned.contains('\n') || cleaned.contains('\r') {
+                format!("\"{}\"", cleaned.replace("\"", "\"\""))
             } else {
-                s.to_string()
+                cleaned.to_string()
             }
         };
 
@@ -689,7 +693,7 @@ fn find_differences_and_generate_report(
     Ok(report_filename)
 }
 
-/// Helper function to write a DataFrame to CSV manually
+/// Helper function to write a DataFrame to CSV manually with proper escaping
 fn write_dataframe_to_csv(
     df: &DataFrame,
     file_path: &Path,
@@ -704,6 +708,24 @@ fn write_dataframe_to_csv(
     let column_names = df.get_column_names();
     writeln!(writer, "{}", column_names.join(&separator.to_string()))?;
 
+    // Improved CSV value escaping
+    let escape_csv_value = |value: String| -> String {
+        // Handle null/None values from Polars
+        if value == "null" {
+            return String::new();
+        }
+
+        // Remove any existing outer quotes from Polars string representation
+        let cleaned = value.trim_matches('"');
+
+        // Only add quotes if necessary
+        if cleaned.contains(separator) || cleaned.contains('"') || cleaned.contains('\n') || cleaned.contains('\r') {
+            format!("\"{}\"", cleaned.replace("\"", "\"\""))
+        } else {
+            cleaned.to_string()
+        }
+    };
+
     // Write data rows
     let height = df.height();
     for row_idx in 0..height {
@@ -712,14 +734,7 @@ fn write_dataframe_to_csv(
         for col_name in &column_names {
             let col = df.column(col_name).unwrap();
             let value = col.get(row_idx).unwrap().to_string();
-
-            // Handle CSV escaping
-            let escaped_value = if value.contains(separator) || value.contains('"') || value.contains('\n') {
-                format!("\"{}\"", value.replace("\"", "\"\""))
-            } else {
-                value
-            };
-
+            let escaped_value = escape_csv_value(value);
             row_values.push(escaped_value);
         }
 
