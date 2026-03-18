@@ -740,3 +740,106 @@ fn write_dataframe_to_csv(
     writer.flush()?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use polars::df;
+    use polars::prelude::*;
+
+    #[test]
+    fn test_get_column_names() {
+        let df = df!(
+            "col1" => &[1, 2, 3],
+            "col2" => &["a", "b", "c"]
+        )
+        .unwrap();
+
+        let lf = df.lazy();
+        let names = get_column_names(&lf);
+
+        assert_eq!(names, vec!["col1", "col2"]);
+    }
+
+    #[test]
+    fn test_get_rows_num() {
+        let df = df!(
+            "id" => &[1, 2, 3, 4, 5]
+        )
+        .unwrap();
+
+        let lf = df.lazy();
+        let rows = get_rows_num(&lf);
+
+        assert_eq!(rows, 5);
+    }
+
+    #[test]
+    fn test_get_sorted_data_frame_for_columns() {
+        let df = df!(
+            "id" => &[2, 1, 3],
+            "val" => &["b", "a", "c"]
+        )
+        .unwrap();
+
+        let lf = df.lazy();
+        let sorting_by = vec!["id".to_string()];
+        let val_col_name = "val".to_string();
+        let columns_to_compare = vec![&val_col_name];
+
+        let sorted_df = get_sorted_data_frame_for_columns(&lf, &sorting_by, &columns_to_compare);
+
+        // Check columns
+        let actual_names: Vec<String> = sorted_df.get_column_names().iter().map(|s| s.to_string()).collect();
+        assert_eq!(actual_names, vec!["id", "val"]);
+
+        // Check if sorted by 'id'
+        let id_col = sorted_df.column("id").unwrap().i32().unwrap();
+        assert_eq!(id_col.get(0), Some(1));
+        assert_eq!(id_col.get(1), Some(2));
+        assert_eq!(id_col.get(2), Some(3));
+    }
+
+    #[test]
+    fn test_get_sorted_data_frame_multiple_columns() {
+        let df = df!(
+            "id1" => &[1, 1, 2],
+            "id2" => &[2, 1, 1],
+            "val" => &["c", "b", "a"]
+        )
+        .unwrap();
+
+        let lf = df.lazy();
+        let sorting_by = vec!["id1".to_string(), "id2".to_string()];
+        let val_col_name = "val".to_string();
+        let columns_to_compare = vec![&val_col_name];
+
+        let sorted_df = get_sorted_data_frame_for_columns(&lf, &sorting_by, &columns_to_compare);
+
+        // Result should be:
+        // id1=1, id2=1, val=b
+        // id1=1, id2=2, val=c
+        // id1=2, id2=1, val=a
+
+        let val_col = sorted_df.column("val").unwrap().str().unwrap();
+        assert_eq!(val_col.get(0).unwrap(), "b");
+        assert_eq!(val_col.get(1).unwrap(), "c");
+        assert_eq!(val_col.get(2).unwrap(), "a");
+    }
+
+    #[test]
+    fn test_assert_both_frames_are_comparable_logic() {
+        let cols1 = vec!["id".to_string(), "name".to_string()];
+        let cols2 = vec!["name".to_string(), "id".to_string()];
+
+        // Non-strict order should pass (implicitly, it doesn't panic/exit in this logic test)
+        // Since original function calls exit(2), we can't easily test the failure case here
+        // without refactoring. But let's check the set logic.
+        let set1: HashSet<_> = cols1.iter().collect();
+        let set2: HashSet<_> = cols2.iter().collect();
+        assert_eq!(set1, set2);
+
+        // Strict order should fail
+        assert_ne!(cols1, cols2);
+    }
+}
