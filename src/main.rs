@@ -3,7 +3,7 @@ use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use polars::frame::DataFrame;
 use polars::prelude::{
-    col, IndexOfSchema, IntoVec, LazyCsvReader, LazyFileListReader, LazyFrame, SortOptions,
+    col, LazyCsvReader, LazyFileListReader, LazyFrame, SortMultipleOptions,
 };
 use std::collections::HashSet;
 use std::fs::File;
@@ -307,8 +307,8 @@ fn assert_both_frames_are_comparable(
 }
 
 fn get_lazy_frame(file_path: &str, delimiter: char) -> LazyFrame {
-    LazyCsvReader::new(file_path)
-        .has_header(true)
+    LazyCsvReader::new(file_path.into())
+        .with_has_header(true)
         .with_infer_schema_length(Some(0))
         .with_separator(delimiter as u8)
         .finish()
@@ -316,14 +316,13 @@ fn get_lazy_frame(file_path: &str, delimiter: char) -> LazyFrame {
 }
 
 fn get_column_names(lazy_frame: &LazyFrame) -> Vec<String> {
-    let schema = lazy_frame
+    let df = lazy_frame
         .clone()
         .limit(1)
         .collect()
-        .expect("Couldn't parse first CSV file")
-        .schema();
+        .expect("Couldn't parse first CSV file");
 
-    schema.get_names().into_vec()
+    df.schema().iter_names().map(|s| s.to_string()).collect()
 }
 
 fn get_sorted_data_frame_for_columns(
@@ -342,16 +341,14 @@ fn get_sorted_data_frame_for_columns(
     for next_column in columns {
         // We must de-reference next_column as the iterator returns a reference of a reference
         if !sorting_by_columns.contains(*next_column) {
-            all_columns.push(col(next_column));
+            all_columns.push(col(*next_column));
         }
     }
 
     let mut lazy_query = lazy_frame.clone().select(all_columns);
 
     // Sort by multiple columns
-    for sort_col in sorting_by_columns {
-        lazy_query = lazy_query.sort(sort_col, SortOptions::default());
-    }
+    lazy_query = lazy_query.sort(sorting_by_columns, SortMultipleOptions::default());
 
     lazy_query
         .collect()
@@ -386,23 +383,21 @@ fn find_differences_and_generate_report(
     use std::io::{BufRead, BufReader};
 
     // Create lazy frames for both files
-    let mut lf1 = LazyCsvReader::new(file1_path)
-        .has_header(true)
+    let mut lf1 = LazyCsvReader::new(file1_path.into())
+        .with_has_header(true)
         .with_infer_schema_length(Some(0))
         .with_separator(separator as u8)
         .finish()?;
 
-    let mut lf2 = LazyCsvReader::new(file2_path)
-        .has_header(true)
+    let mut lf2 = LazyCsvReader::new(file2_path.into())
+        .with_has_header(true)
         .with_infer_schema_length(Some(0))
         .with_separator(separator as u8)
         .finish()?;
 
     // Sort by multiple columns
-    for sort_col in sorting_columns {
-        lf1 = lf1.sort(sort_col, SortOptions::default());
-        lf2 = lf2.sort(sort_col, SortOptions::default());
-    }
+    lf1 = lf1.sort(sorting_columns, SortMultipleOptions::default());
+    lf2 = lf2.sort(sorting_columns, SortMultipleOptions::default());
 
     // Get all column names to understand the structure
     let all_column_names = get_column_names(&lf1);
@@ -706,7 +701,8 @@ fn write_dataframe_to_csv(
 
     // Write header
     let column_names = df.get_column_names();
-    writeln!(writer, "{}", column_names.join(&separator.to_string()))?;
+    let column_names_str: Vec<String> = column_names.iter().map(|s| s.to_string()).collect();
+    writeln!(writer, "{}", column_names_str.join(&separator.to_string()))?;
 
     // Improved CSV value escaping
     let escape_csv_value = |value: String| -> String {
@@ -732,7 +728,7 @@ fn write_dataframe_to_csv(
         let mut row_values = Vec::new();
 
         for col_name in &column_names {
-            let col = df.column(col_name).unwrap();
+            let col = df.column(*col_name).unwrap();
             let value = col.get(row_idx).unwrap().to_string();
             let escaped_value = escape_csv_value(value);
             row_values.push(escaped_value);
