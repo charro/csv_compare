@@ -128,9 +128,7 @@ fn main() {
     let mut files_are_different = false; // Track if any differences were found
 
     // Skip sorting columns when comparing
-    for i in 0..first_file_cols.len() {
-        let column_name = &first_file_cols[i];
-
+    for (i, column_name) in first_file_cols.iter().enumerate() {
         // Skip sorting columns
         if sorting_columns.contains(column_name) {
             continue;
@@ -163,7 +161,7 @@ fn main() {
 
                     // Check if this specific column has differences
                     if col1 != col2 {
-                        columns_with_differences.insert(col_name.to_string());
+                        columns_with_differences.insert((*col_name).to_string());
                     }
                 }
             }
@@ -247,8 +245,8 @@ fn assert_both_frames_have_same_row_num(
             "{}: {} {} <> {}",
             "FILES ARE DIFFERENT".red(),
             "Different number of rows".red(),
-            first_row_num.to_string(),
-            second_row_num.to_string()
+            first_row_num,
+            second_row_num
         );
 
         // Generate report if requested
@@ -266,7 +264,7 @@ fn assert_both_frames_have_same_row_num(
         exit(4);
     }
 
-    return first_row_num;
+    first_row_num
 }
 
 fn assert_both_frames_are_comparable(
@@ -295,12 +293,7 @@ fn assert_both_frames_are_comparable(
             second_file_cols.join(",").bold().blue()
         );
         if is_strict_order {
-            println!(
-                "{} {} {}",
-                "Hint:",
-                "--strict-order".bold(),
-                "flag is active"
-            );
+            println!("Hint: {} flag is active", "--strict-order".bold());
         }
 
         // Generate report if requested
@@ -337,7 +330,7 @@ fn get_lazy_frame(file_path: &str, delimiter: char) -> LazyFrame {
         .with_infer_schema_length(Some(0))
         .with_separator(delimiter as u8)
         .finish()
-        .expect(format!("Couldn't open file {file_path}").as_str())
+        .unwrap_or_else(|_| panic!("Couldn't open file {file_path}"))
 }
 
 fn get_column_names(lazy_frame: &LazyFrame) -> Vec<String> {
@@ -382,13 +375,13 @@ fn get_sorted_data_frame_for_columns(
 
 fn get_rows_num(lazy_frame: &LazyFrame) -> u32 {
     let first_column_name = get_column_names(&lazy_frame.clone())[0].to_string();
-    return lazy_frame
+    lazy_frame
         .clone()
         .select([col(first_column_name.as_str())])
         .collect()
         .expect("Error when counting the rows of the CSV file")
         .shape()
-        .0 as u32;
+        .0 as u32
 }
 
 /// Finds differences between two CSV files and generates a detailed report
@@ -445,7 +438,7 @@ fn find_differences_and_generate_report(
     let temp_file2 = temp_dir.join(format!("csv_compare_temp2_{}.csv", std::process::id()));
 
     // Export sorted data to temporary files
-    let columns_to_select: Vec<_> = columns_to_export.iter().map(|s| col(s)).collect();
+    let columns_to_select: Vec<_> = columns_to_export.iter().map(col).collect();
 
     let df1_sorted = lf1.select(columns_to_select.clone()).collect()?;
     let df2_sorted = lf2.select(columns_to_select).collect()?;
@@ -482,21 +475,21 @@ fn find_differences_and_generate_report(
     // Write report header
     writeln!(report_file, "CSV Differences Report")?;
     writeln!(report_file, "======================")?;
-    writeln!(report_file, "File 1: {}", file1_path)?;
-    writeln!(report_file, "File 2: {}", file2_path)?;
+    writeln!(report_file, "File 1: {file1_path}")?;
+    writeln!(report_file, "File 2: {file2_path}")?;
     writeln!(
         report_file,
         "Sorting Column(s): {}",
         sorting_columns.join(", ")
     )?;
-    writeln!(report_file, "Total Rows: {}", total_rows)?;
+    writeln!(report_file, "Total Rows: {total_rows}")?;
     writeln!(report_file, "Total Columns: {}", all_column_names.len())?;
     writeln!(
         report_file,
         "Columns with differences: {:?}",
         columns_with_differences.iter().collect::<Vec<_>>()
     )?;
-    writeln!(report_file, "")?;
+    writeln!(report_file)?;
 
     // Now do fast line-by-line comparison
     let file1_reader = BufReader::new(std::fs::File::open(&temp_file1)?);
@@ -568,7 +561,7 @@ fn find_differences_and_generate_report(
                     if idx < cols1.len() {
                         let col_name = &sorting_columns
                             [sorting_indices.iter().position(|&x| x == idx).unwrap()];
-                        sorting_values.push(format!("{} = {}", col_name, cols1[idx]));
+                        sorting_values.push(format!("{col_name} = {}", cols1[idx]));
                     }
                 }
                 let composite_key = sorting_values.join(", ");
@@ -632,34 +625,32 @@ fn find_differences_and_generate_report(
         // Use detailed format for small number of differences
         writeln!(report_file, "Differences found:")?;
         writeln!(report_file, "==================")?;
-        writeln!(report_file, "")?;
+        writeln!(report_file)?;
 
         for (composite_key, row_diffs) in &all_differences {
-            writeln!(report_file, "{}:", composite_key)?;
+            writeln!(report_file, "{composite_key}:")?;
             for (col_name, val1, val2) in row_diffs {
-                writeln!(report_file, "  Column '{}':", col_name)?;
-                writeln!(report_file, "    File 1: {}", val1)?;
-                writeln!(report_file, "    File 2: {}", val2)?;
+                writeln!(report_file, "  Column '{col_name}':")?;
+                writeln!(report_file, "    File 1: {val1}")?;
+                writeln!(report_file, "    File 2: {val2}")?;
             }
-            writeln!(report_file, "")?;
+            writeln!(report_file)?;
         }
     } else {
         // Create separate CSV file for many differences
         writeln!(
             report_file,
-            "Many differences found ({} total differences).",
-            total_differences
+            "Many differences found ({total_differences} total differences)."
         )?;
         writeln!(
             report_file,
-            "Creating separate CSV file for detailed analysis: {}",
-            csv_filename
+            "Creating separate CSV file for detailed analysis: {csv_filename}"
         )?;
         writeln!(
             report_file,
             "========================================================"
         )?;
-        writeln!(report_file, "")?;
+        writeln!(report_file)?;
 
         // Create CSV file with buffered writing for better performance
         let csv_file = File::create(&csv_filename)?;
@@ -680,7 +671,7 @@ fn find_differences_and_generate_report(
                 || cleaned.contains('\n')
                 || cleaned.contains('\r')
             {
-                format!("\"{}\"", cleaned.replace("\"", "\"\""))
+                format!("\"{}\"", cleaned.replace('"', "\"\""))
             } else {
                 cleaned.to_string()
             }
@@ -706,25 +697,23 @@ fn find_differences_and_generate_report(
         // Show a sample of first few differences in the text report
         writeln!(
             report_file,
-            "Sample of first 10 differences (see {} for complete list):",
-            csv_filename
+            "Sample of first 10 differences (see {csv_filename} for complete list):"
         )?;
         writeln!(
             report_file,
             "================================================================="
         )?;
-        writeln!(report_file, "")?;
+        writeln!(report_file)?;
 
         let sample_count = std::cmp::min(10, all_differences.len());
-        for i in 0..sample_count {
-            let (composite_key, row_diffs) = &all_differences[i];
-            writeln!(report_file, "{}:", composite_key)?;
+        for (composite_key, row_diffs) in all_differences.iter().take(sample_count) {
+            writeln!(report_file, "{composite_key}:")?;
             for (col_name, val1, val2) in row_diffs {
-                writeln!(report_file, "  Column '{}':", col_name)?;
-                writeln!(report_file, "    File 1: {}", val1)?;
-                writeln!(report_file, "    File 2: {}", val2)?;
+                writeln!(report_file, "  Column '{col_name}':")?;
+                writeln!(report_file, "    File 1: {val1}")?;
+                writeln!(report_file, "    File 2: {val2}")?;
             }
-            writeln!(report_file, "")?;
+            writeln!(report_file)?;
         }
 
         if all_differences.len() > sample_count {
@@ -733,7 +722,7 @@ fn find_differences_and_generate_report(
                 "... and {} more rows with differences (see CSV file for complete details)",
                 all_differences.len() - sample_count
             )?;
-            writeln!(report_file, "")?;
+            writeln!(report_file)?;
         }
     }
 
@@ -742,13 +731,11 @@ fn find_differences_and_generate_report(
     writeln!(report_file, "=========")?;
     writeln!(
         report_file,
-        "Total rows with differences: {}",
-        rows_with_differences
+        "Total rows with differences: {rows_with_differences}"
     )?;
     writeln!(
         report_file,
-        "Total individual cell differences: {}",
-        total_differences
+        "Total individual cell differences: {total_differences}"
     )?;
     writeln!(
         report_file,
@@ -759,20 +746,18 @@ fn find_differences_and_generate_report(
     if csv_file_created {
         writeln!(
             report_file,
-            "Detailed differences exported to: {}",
-            csv_filename
+            "Detailed differences exported to: {csv_filename}"
         )?;
     }
 
     if total_differences > 0 {
-        writeln!(report_file, "")?;
+        writeln!(report_file)?;
         if total_differences <= 50 {
             writeln!(report_file, "❌ Files have differences as listed above.")?;
         } else {
             writeln!(
                 report_file,
-                "❌ Files have many differences. See {} for detailed analysis in Excel.",
-                csv_filename
+                "❌ Files have many differences. See {csv_filename} for detailed analysis in Excel."
             )?;
         }
     }
@@ -813,7 +798,7 @@ fn write_dataframe_to_csv(
             || cleaned.contains('\n')
             || cleaned.contains('\r')
         {
-            format!("\"{}\"", cleaned.replace("\"", "\"\""))
+            format!("\"{}\"", cleaned.replace('"', "\"\""))
         } else {
             cleaned.to_string()
         }
@@ -825,7 +810,7 @@ fn write_dataframe_to_csv(
         let mut row_values = Vec::new();
 
         for col_name in &column_names {
-            let col = df.column(*col_name).unwrap();
+            let col = df.column(col_name).unwrap();
             let value = col.get(row_idx).unwrap().to_string();
             let escaped_value = escape_csv_value(value);
             row_values.push(escaped_value);
