@@ -17,20 +17,6 @@ A high-performance command-line tool built in Rust for comparing large CSV files
 
 Download the latest binary from the [Releases](https://github.com/charro/csv_compare/releases) page.
 
-### Build from Source
-
-### Prerequisites
-- Rust (latest stable version)
-- Cargo package manager
-
-```bash
-git clone https://github.com/charro/csv_compare.git
-cd csv_compare
-cargo build --release
-```
-
-The compiled binary will be available at `target/release/csv-compare`.
-
 ## Usage
 
 ### Basic Usage
@@ -254,6 +240,20 @@ FILES ARE DIFFERENT: Different columns => [col1,col2,col3] != [col1,col3,col2]
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
+
+### Build from Source
+
+### Prerequisites
+- Rust (latest stable version)
+- Cargo package manager
+
+```bash
+git clone https://github.com/charro/csv_compare.git
+cd csv_compare
+cargo build --release
+```
+
+The compiled binary will be available at `target/release/csv-compare`.
 
 ## Dependencies
 
